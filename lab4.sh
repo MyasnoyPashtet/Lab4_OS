@@ -13,8 +13,10 @@ readonly DATA_DIR="$PROJECT_DIR/data/labfiles-3-26"
 
 readonly CIRCUS_SUBJECT='Цирковое_Дело'
 readonly RETAKES_SUBJECT='Пересдачеведение'
+readonly -a TEST_NUMBERS=(1 2 3 4)
 readonly GROUP_PATTERN='^[^[:space:][:cntrl:];/\\:*?"<>|]+$'
 readonly LOGIN_PATTERN='[^[:space:][:cntrl:];]+'
+readonly ATTEMPT_PATTERN="^($LOGIN_PATTERN);($LOGIN_PATTERN);([0-9]{4}-[0-9]{2}-[0-9]{2});[0-9]+;([2-5])[+-]*$"
 
 error() {
     printf 'Ошибка. %s\n' "$*" >&2
@@ -104,6 +106,22 @@ valid_date() {
     ((day <= days_in_month[month]))
 }
 
+parse_attempt() {
+    local line=$1 file=$2 line_number=$3
+    local -n fields=$4
+    if [[ ! $line =~ $ATTEMPT_PATTERN ]]; then
+        error "«$file», строка $line_number: неверный формат попытки тестирования."
+        return 1
+    fi
+    # Сохраняем группу, логин, дату и цифру оценки без суффикса.
+    fields=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}")
+    local group=${fields[0]}
+    if [[ ! $group =~ $GROUP_PATTERN || $group == . || $group == .. ]] || ! valid_date "${fields[2]}"; then
+        error "«$file», строка $line_number: неверная группа или календарная дата."
+        return 1
+    fi
+}
+
 attendance() {
     local group=$1 subject subject_dir
     validate_group_subject "$group" "$2" subject || return 2
@@ -157,30 +175,19 @@ failed_tests() {
     resolve_subject_dir "$subject" subject_dir || return 1
 
     local -A roster=() status=()
-    local -a lines=() rows=()
+    local -a lines=() attempt=() rows=()
     local file="$subject_dir/tests/TEST-$test"
-    local index line attempt_group login date grade
-    local pattern="^($LOGIN_PATTERN);($LOGIN_PATTERN);([0-9]{4}-[0-9]{2}-[0-9]{2});[0-9]+;([2-5])[+-]*$"
+    local index line login grade
     load_roster "$group" roster || return 1
     read_data_lines "$file" lines || return 1
 
     for index in "${!lines[@]}"; do
         line=${lines[$index]%$'\r'}
         [[ $line =~ ^[[:blank:]]*$ ]] && continue
-        if [[ ! $line =~ $pattern ]]; then
-            error "«$file», строка $((index + 1)): неверный формат попытки тестирования."
-            return 1
-        fi
-        # Регулярное выражение выделяет цифру оценки без суффикса.
-        attempt_group=${BASH_REMATCH[1]}
-        login=${BASH_REMATCH[2]}
-        date=${BASH_REMATCH[3]}
-        grade=${BASH_REMATCH[4]}
-        if [[ ! $attempt_group =~ $GROUP_PATTERN || $attempt_group == . || $attempt_group == .. ]] || ! valid_date "$date"; then
-            error "«$file», строка $((index + 1)): неверная группа или календарная дата."
-            return 1
-        fi
-        [[ $attempt_group == "$group" && ${roster[$login]+found} ]] || continue
+        parse_attempt "$line" "$file" "$((index + 1))" attempt || return 1
+        login=${attempt[1]}
+        grade=${attempt[3]}
+        [[ ${attempt[0]} == "$group" && ${roster[$login]+found} ]] || continue
         # После успешной попытки следующие оценки статус не меняют.
         [[ ${status[$login]} == 'Сдал' ]] && continue
         if ((grade >= 3)); then
@@ -203,6 +210,127 @@ failed_tests() {
     printf '%s\n' "${rows[@]}" | LC_ALL=C sort -t $'\t' -k1,1
 }
 
+top_students() {
+    local limit=$1 subject_dir
+    if [[ ! $limit =~ ^[0-9]+$ || ! $limit =~ [1-9] ]]; then
+        usage_error 'Количество студентов должно быть положительным целым числом.'
+        return 2
+    fi
+    # N нужен только для сравнения со счётчиком строк. Убираем начальные нули
+    # и оставляем его строкой, чтобы большие значения не переполняли арифметику.
+    limit=${limit#"${limit%%[!0]*}"}
+    resolve_subject_dir "$CIRCUS_SUBJECT" subject_dir || return 1
+
+    local -A sums=() counts=() details=() shown=()
+    local -a lines=() attempt=()
+    local test file index line date grade key
+
+    for test in "${TEST_NUMBERS[@]}"; do
+        file="$subject_dir/tests/TEST-$test"
+        read_data_lines "$file" lines || return 1
+        for index in "${!lines[@]}"; do
+            line=${lines[$index]%$'\r'}
+            [[ $line =~ ^[[:blank:]]*$ ]] && continue
+            parse_attempt "$line" "$file" "$((index + 1))" attempt || return 1
+            date=${attempt[2]}
+            grade=${attempt[3]}
+            ((grade >= 3)) || continue
+            # Один логин может встретиться в разных группах. Каждая строка
+            # успешной попытки добавляется к сумме и к числу попыток отдельно.
+            key="${attempt[0]};${attempt[1]}"
+            sums[$key]=$(( ${sums[$key]:-0} + grade ))
+            counts[$key]=$(( ${counts[$key]:-0} + 1 ))
+            details[$key]+="    TEST-$test  $date  $grade"$'\n'
+        done
+    done
+
+    if ((${#sums[@]} == 0)); then
+        printf 'Успешных попыток по Цирковому делу не найдено.\n'
+        return 0
+    fi
+
+    local best best_sum best_count sum count mean rank=0
+    local LC_ALL=C
+    printf 'Место\tЛогин\tГруппа\tСредний балл\tУспешных попыток\n'
+    while [[ $rank != "$limit" ]] && ((rank < ${#sums[@]})); do
+        best='' best_sum=0 best_count=1
+        for key in "${!sums[@]}"; do
+            [[ ${shown[$key]+found} ]] && continue
+            sum=${sums[$key]} count=${counts[$key]}
+
+            # Сравниваем дроби по перекрёстным произведениям. Округление
+            # для вывода не меняет места. При равенстве сравниваем ключи.
+            if ((sum * best_count > best_sum * count)) ||
+               { ((sum * best_count == best_sum * count)) && [[ $key < $best ]]; }; then
+                best=$key best_sum=$sum best_count=$count
+            fi
+        done
+
+        shown[$best]=1
+        ((++rank))
+        mean=$(( (100 * best_sum + best_count / 2) / best_count ))
+        printf '%d\t%s\t%s\t%d.%02d\t%d\n' "$rank" "${best#*;}" "${best%%;*}" \
+            "$((mean / 100))" "$((mean % 100))" "$best_count"
+        printf '%s' "${details[$best]}"
+    done
+}
+
+collect_first_attempts() {
+    local subject=$1 subject_dir=$2 test=$3 year=$4
+    local -n output_rows=$5
+    local -a lines=() attempt=()
+    local -A earliest=()
+    local file="$subject_dir/tests/TEST-$test"
+    local index line date grade key
+    read_data_lines "$file" lines || return 1
+
+    for index in "${!lines[@]}"; do
+        line=${lines[$index]%$'\r'}
+        [[ $line =~ ^[[:blank:]]*$ ]] && continue
+        parse_attempt "$line" "$file" "$((index + 1))" attempt || return 1
+        date=${attempt[2]}
+        grade=${attempt[3]}
+        key="${attempt[0]};${attempt[1]}"
+        # Даты ГГГГ-ММ-ДД сравниваются как строки. Строгое сравнение
+        # сохраняет первую строку файла, если даты совпали.
+        if [[ ! ${earliest[$key]+found} || $date < ${earliest[$key]%%;*} ]]; then
+            earliest[$key]="$date;$grade"
+        fi
+    done
+
+    # Фильтруем по году и оценке только после выбора первой попытки.
+    for key in "${!earliest[@]}"; do
+        IFS=';' read -r date grade <<< "${earliest[$key]}"
+        if [[ ${date:0:4} == "$year" ]] && ((grade >= 3)); then
+            output_rows+=("${key#*;}"$'\t'"${key%%;*}"$'\t'"$subject"$'\t'"TEST-$test"$'\t'"$date"$'\t'"$grade")
+        fi
+    done
+}
+
+first_attempt() {
+    local year=$1
+    if [[ ! $year =~ ^[0-9]{4}$ || $year == 0000 ]]; then
+        usage_error 'Укажите календарный год четырьмя цифрами, например 2026.'
+        return 2
+    fi
+
+    local subject subject_dir test
+    local -a rows=()
+    for subject in "$RETAKES_SUBJECT" "$CIRCUS_SUBJECT"; do
+        resolve_subject_dir "$subject" subject_dir || return 1
+        for test in "${TEST_NUMBERS[@]}"; do
+            collect_first_attempts "$subject" "$subject_dir" "$test" "$year" rows || return 1
+        done
+    done
+
+    if ((${#rows[@]} == 0)); then
+        printf 'Успешных первых попыток за %s год не найдено.\n' "$year"
+        return 0
+    fi
+    printf 'Логин\tГруппа\tПредмет\tТест\tДата\tОценка\n'
+    printf '%s\n' "${rows[@]}" | LC_ALL=C sort -t $'\t' -k2,2 -k1,1 -k3,3 -k4,4
+}
+
 show_help() {
     cat <<'HELP'
 Анализ посещаемости и результатов тестирования студентов
@@ -210,6 +338,8 @@ show_help() {
   bash lab4.sh                              Интерактивное меню
   bash lab4.sh attendance ГРУППА ПРЕДМЕТ     Рейтинг посещаемости
   bash lab4.sh failed ГРУППА ПРЕДМЕТ НОМЕР   Студенты, не сдавшие тест
+  bash lab4.sh top [N]                      Лучшие по Цирковому делу (по умолчанию 10)
+  bash lab4.sh first-attempt ГОД             Успешные первые попытки за календарный год
   bash lab4.sh --help                       Эта справка
 
 Предметы: Пересдачеведение, Цирковое_Дело. Номера тестов: 1–4.
@@ -229,6 +359,14 @@ run_command() {
             if (($# != 3)); then usage_error 'Нужны группа, предмет и номер теста.'; return 2; fi
             failed_tests "$1" "$2" "$3"
             ;;
+        top)
+            if (($# > 1)); then usage_error 'Команда top принимает только количество студентов.'; return 2; fi
+            top_students "${1-10}"
+            ;;
+        first-attempt)
+            if (($# != 1)); then usage_error 'Укажите один календарный год.'; return 2; fi
+            first_attempt "$1"
+            ;;
         --help)
             if (($# != 0)); then usage_error 'У справки нет дополнительных параметров.'; return 2; fi
             show_help
@@ -245,7 +383,7 @@ read_menu_input() {
 }
 
 interactive_menu() {
-    local choice group subject test answer
+    local choice group subject test limit year answer
     while true; do
         cat <<'MENU'
 ========================================
@@ -254,6 +392,8 @@ interactive_menu() {
 
 1. Рейтинг посещаемости
 2. Студенты, не сдавшие тест
+3. Лучшие студенты по Цирковому делу
+4. Студенты, сдавшие с первой попытки
 
 0. Выход
 
@@ -275,7 +415,17 @@ MENU
                     run_command failed "$group" "$subject" "$test"
                 fi
                 ;;
-            *) error 'Выберите 0, 1 или 2.' ;;
+            3)
+                printf 'Количество студентов [10]: '
+                read_menu_input limit || return 0
+                run_command top "${limit:-10}"
+                ;;
+            4)
+                printf 'Календарный год: '
+                read_menu_input year || return 0
+                run_command first-attempt "$year"
+                ;;
+            *) error 'Выберите пункт от 0 до 4.' ;;
         esac
 
         printf '\nEnter — вернуться в меню, 0 — выйти: '
