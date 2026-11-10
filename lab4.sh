@@ -27,35 +27,27 @@ usage_error() {
 }
 
 validate_group_subject() {
-    local group=$1 requested circus retakes
+    local group=$1 requested=${2//[[:blank:]_-]/}
+    local circus=${CIRCUS_SUBJECT//_/}
     local -n selected_subject=$3
     if [[ ! $group =~ $GROUP_PATTERN || $group == . || $group == .. ]]; then
         usage_error 'Укажите имя группы, например A-06-23.'
         return 2
     fi
-    subject_key "$2" requested
-    subject_key "$CIRCUS_SUBJECT" circus
-    subject_key "$RETAKES_SUBJECT" retakes
-    case $requested in
-        "$circus") selected_subject=$CIRCUS_SUBJECT ;;
-        "$retakes") selected_subject=$RETAKES_SUBJECT ;;
+    case ${requested,,} in
+        "${circus,,}") selected_subject=$CIRCUS_SUBJECT ;;
+        "${RETAKES_SUBJECT,,}") selected_subject=$RETAKES_SUBJECT ;;
         *) usage_error "Выберите предмет «$CIRCUS_SUBJECT» или «$RETAKES_SUBJECT»." ;;
     esac
-}
-
-require_data() {
-    [[ -d $DATA_DIR ]] || error "Не найден каталог данных «$DATA_DIR». Поместите labfiles-3-26 в папку data."
-}
-
-subject_key() {
-    local -n normalized=$2
-    local name=${1//[[:blank:]_-]/}
-    normalized=${name,,}
 }
 
 resolve_subject_dir() {
     local subject=$1
     local -n found_dir=$2
+    if [[ ! -d $DATA_DIR ]]; then
+        error "Не найден каталог данных «$DATA_DIR». Поместите labfiles-3-26 в папку data."
+        return 1
+    fi
     found_dir="$DATA_DIR/$subject"
     [[ -d $found_dir ]] || error "В «$DATA_DIR» не найден каталог предмета «$subject»."
 }
@@ -76,7 +68,16 @@ read_data_lines() {
 load_roster() {
     local group=$1
     local -n output_roster=$2
-    local file="$DATA_DIR/students/groups/$group" line index
+    local file line index
+    # Windows открывает файл даже при неверном регистре. Для поиска
+    # попыток нужно точное имя группы, поэтому сверяем его со списком файлов.
+    for file in "$DATA_DIR/students/groups/"*; do
+        [[ ${file##*/} == "$group" ]] && break
+    done
+    if [[ ${file##*/} != "$group" ]]; then
+        error "Группа «$group» не найдена. Проверьте имя файла и регистр букв."
+        return 1
+    fi
     local -a lines=()
     read_data_lines "$file" lines || return 1
     output_roster=()
@@ -103,37 +104,9 @@ valid_date() {
     ((day <= days_in_month[month]))
 }
 
-load_attempts() {
-    local file=$1
-    local -n output_attempts=$2
-    local -a lines=()
-    local line index group login date grade
-    local pattern="^($LOGIN_PATTERN);($LOGIN_PATTERN);([0-9]{4}-[0-9]{2}-[0-9]{2});[0-9]+;([2-5])[+-]*$"
-    read_data_lines "$file" lines || return 1
-    output_attempts=()
-
-    # Разбираем файл в исходном порядке. Четвёртая группа регулярного выражения
-    # содержит базовую оценку, а суффикс и число верных ответов в отчёты не нужны.
-    for index in "${!lines[@]}"; do
-        line=${lines[$index]%$'\r'}
-        [[ $line =~ ^[[:blank:]]*$ ]] && continue
-        if [[ ! $line =~ $pattern ]]; then
-            error "«$file», строка $((index + 1)): неверный формат попытки тестирования."
-            return 1
-        fi
-        group=${BASH_REMATCH[1]} login=${BASH_REMATCH[2]} date=${BASH_REMATCH[3]} grade=${BASH_REMATCH[4]}
-        if [[ ! $group =~ $GROUP_PATTERN || $group == . || $group == .. ]] || ! valid_date "$date"; then
-            error "«$file», строка $((index + 1)): неверная группа или календарная дата."
-            return 1
-        fi
-        output_attempts+=("$group;$login;$date;$grade")
-    done
-}
-
 attendance() {
     local group=$1 subject subject_dir
     validate_group_subject "$group" "$2" subject || return 2
-    require_data || return 1
     resolve_subject_dir "$subject" subject_dir || return 1
 
     local -A roster=() visits=()
@@ -181,32 +154,45 @@ failed_tests() {
         usage_error 'Номер теста должен быть от 1 до 4.'
         return 2
     fi
-    require_data || return 1
     resolve_subject_dir "$subject" subject_dir || return 1
 
-    local -A roster=() attempted=() passed=()
-    local -a attempts=() rows=()
-    local attempt attempt_group login date grade
+    local -A roster=() status=()
+    local -a lines=() rows=()
+    local file="$subject_dir/tests/TEST-$test"
+    local index line attempt_group login date grade
+    local pattern="^($LOGIN_PATTERN);($LOGIN_PATTERN);([0-9]{4}-[0-9]{2}-[0-9]{2});[0-9]+;([2-5])[+-]*$"
     load_roster "$group" roster || return 1
-    load_attempts "$subject_dir/tests/TEST-$test" attempts || return 1
+    read_data_lines "$file" lines || return 1
 
-    for attempt in "${attempts[@]}"; do
-        IFS=';' read -r attempt_group login date grade <<< "$attempt"
+    for index in "${!lines[@]}"; do
+        line=${lines[$index]%$'\r'}
+        [[ $line =~ ^[[:blank:]]*$ ]] && continue
+        if [[ ! $line =~ $pattern ]]; then
+            error "«$file», строка $((index + 1)): неверный формат попытки тестирования."
+            return 1
+        fi
+        # Регулярное выражение выделяет цифру оценки без суффикса.
+        attempt_group=${BASH_REMATCH[1]}
+        login=${BASH_REMATCH[2]}
+        date=${BASH_REMATCH[3]}
+        grade=${BASH_REMATCH[4]}
+        if [[ ! $attempt_group =~ $GROUP_PATTERN || $attempt_group == . || $attempt_group == .. ]] || ! valid_date "$date"; then
+            error "«$file», строка $((index + 1)): неверная группа или календарная дата."
+            return 1
+        fi
         [[ $attempt_group == "$group" && ${roster[$login]+found} ]] || continue
-        attempted[$login]=1
-        # Успех запоминается независимо от оценок более поздних попыток.
+        # После успешной попытки следующие оценки статус не меняют.
+        [[ ${status[$login]} == 'Сдал' ]] && continue
         if ((grade >= 3)); then
-            passed[$login]=1
+            status[$login]='Сдал'
+        else
+            status[$login]='Не сдал'
         fi
     done
 
     for login in "${!roster[@]}"; do
-        [[ ${passed[$login]+found} ]] && continue
-        if [[ ${attempted[$login]+found} ]]; then
-            rows+=("$login"$'\tНе сдал')
-        else
-            rows+=("$login"$'\tНе проходил')
-        fi
+        [[ ${status[$login]} == 'Сдал' ]] && continue
+        rows+=("$login"$'\t'"${status[$login]:-Не проходил}")
     done
 
     if ((${#rows[@]} == 0)); then
@@ -251,6 +237,13 @@ run_command() {
     esac
 }
 
+read_menu_input() {
+    local -n input=$1
+    read -r input || return 1
+    # При чтении из файла Windows после перевода строки остаётся символ CR.
+    input=${input%$'\r'}
+}
+
 interactive_menu() {
     local choice group subject test answer
     while true; do
@@ -266,19 +259,19 @@ interactive_menu() {
 
 MENU
         printf 'Выберите действие: '
-        read -r choice || return 0
+        read_menu_input choice || return 0
         case $choice in
             0) return 0 ;;
             1|2)
                 printf 'Группа (например, A-06-23): '
-                read -r group || return 0
+                read_menu_input group || return 0
                 printf 'Предмет (%s или %s): ' "$RETAKES_SUBJECT" "$CIRCUS_SUBJECT"
-                read -r subject || return 0
+                read_menu_input subject || return 0
                 if [[ $choice == 1 ]]; then
                     run_command attendance "$group" "$subject"
                 else
                     printf 'Номер теста (1–4): '
-                    read -r test || return 0
+                    read_menu_input test || return 0
                     run_command failed "$group" "$subject" "$test"
                 fi
                 ;;
@@ -286,7 +279,7 @@ MENU
         esac
 
         printf '\nEnter — вернуться в меню, 0 — выйти: '
-        read -r answer || return 0
+        read_menu_input answer || return 0
         [[ $answer == 0 ]] && return 0
         printf '\n'
     done
