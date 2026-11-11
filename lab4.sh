@@ -8,178 +8,197 @@ if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3))); 
 fi
 
 PROJECT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || exit 1
-readonly PROJECT_DIR
-readonly DATA_DIR="$PROJECT_DIR/data/labfiles-3-26"
-
-readonly CIRCUS_SUBJECT='Цирковое_Дело'
-readonly RETAKES_SUBJECT='Пересдачеведение'
-readonly -a TEST_NUMBERS=(1 2 3 4)
-readonly GROUP_PATTERN='^[^[:space:][:cntrl:];/\\:*?"<>|]+$'
-readonly LOGIN_PATTERN='[^[:space:][:cntrl:];]+'
-readonly ATTEMPT_PATTERN="^($LOGIN_PATTERN);($LOGIN_PATTERN);([0-9]{4}-[0-9]{2}-[0-9]{2});[0-9]+;([2-5])[+-]*$"
+declare -a SUBJECTS=() GROUPS_FOUND=()
+shopt -s nullglob
+CONTROL_PATTERN=$'[\x01-\x1f\x7f]'
+GROUP_PATTERN=$'[^;/\x01-\x1f\x7f]+'
+LOGIN_PATTERN='[^[:space:][:cntrl:];]+'
+ATTEMPT_PATTERN="^($GROUP_PATTERN);$LOGIN_PATTERN;([0-9]{4}-[0-9]{2}-[0-9]{2});[0-9]+;[2-5][+-]*$"
 
 error() {
     printf 'Ошибка. %s\n' "$*" >&2
     return 1
 }
 
-usage_error() {
-    error "$* Подсказка: bash lab4.sh --help."
-    return 2
-}
-
-valid_group_name() {
-    [[ $1 =~ $GROUP_PATTERN && $1 != . && $1 != .. ]]
-}
-
-validate_group_subject() {
-    local group=$1 requested circus retakes
-    local -n selected_subject=$3
-    if ! valid_group_name "$group"; then
-        usage_error 'Укажите имя группы латиницей, например A-06-23 или Ae-21-23.'
-        return 2
-    fi
-    case $2 in
-        1) requested=$CIRCUS_SUBJECT ;;
-        2) requested=$RETAKES_SUBJECT ;;
-        *) requested=$2 ;;
-    esac
-    subject_key "$requested" requested
-    subject_key "$CIRCUS_SUBJECT" circus
-    subject_key "$RETAKES_SUBJECT" retakes
-    case $requested in
-        "$circus") selected_subject=$CIRCUS_SUBJECT ;;
-        "$retakes") selected_subject=$RETAKES_SUBJECT ;;
-        *) usage_error "Выберите 1 ($CIRCUS_SUBJECT) или 2 ($RETAKES_SUBJECT)." ;;
-    esac
-}
-
-subject_key() {
-    local -n normalized=$2
-    local name=${1//[[:blank:]_-]/}
-    # Пробелы, разделители и номер в конце имени папки не меняют дисциплину.
-    name=${name%"${name##*[!0-9]}"}
-    # Заменяем кириллицу явно: в локали C оператор ,, не меняет её регистр.
-    local -a upper=(А Б В Г Д Е Ё Ж З И Й К Л М Н О П Р С Т У Ф Х Ц Ч Ш Щ Ъ Ы Ь Э Ю Я)
-    local -a lower=(а б в г д е ё ж з и й к л м н о п р с т у ф х ц ч ш щ ъ ы ь э ю я)
-    local index
-    for index in "${!upper[@]}"; do
-        name=${name//"${upper[index]}"/"${lower[index]}"}
-    done
-    normalized=$name
-}
-
-resolve_subject_dir() {
-    local subject=$1 expected candidate candidate_key
-    local -n found_dir=$2
-    if [[ ! -d $DATA_DIR ]]; then
-        error "Не найден каталог данных «$DATA_DIR». Поместите labfiles-3-26 в папку data."
+choose_data_dir() {
+    local data_root="$PROJECT_DIR/data" path name dataset
+    local -a datasets=()
+    if [[ -L $data_root || ! -d $data_root || ! -r $data_root || ! -x $data_root ]]; then
+        error "Не удалось открыть папку наборов данных «$data_root»."
         return 1
     fi
-    subject_key "$subject" expected
-    found_dir=''
-    for candidate in "$DATA_DIR"/*; do
-        [[ -d $candidate ]] || continue
-        subject_key "${candidate##*/}" candidate_key
-        [[ $candidate_key == "$expected" ]] || continue
-        if [[ -n $found_dir ]]; then
-            error "Для предмета «$subject» найдены несколько каталогов: «$found_dir» и «$candidate». Оставьте один каталог."
-            return 1
-        fi
-        found_dir=$candidate
+    for path in "$data_root"/*; do
+        [[ -d $path/students/groups && ! -L $path ]] || continue
+        name=${path##*/}
+        [[ $name =~ $CONTROL_PATTERN ]] && continue
+        datasets+=("$name")
     done
-    [[ -n $found_dir ]] || error "В «$DATA_DIR» не найден каталог предмета «$subject»."
+    if ((${#datasets[@]} == 0)); then
+        error "В «$data_root» нет наборов данных с папкой students/groups."
+        return 1
+    fi
+
+    choose_item dataset 'Выберите набор данных' 'Выход' "${datasets[@]}" || exit 0
+    DATA_DIR="$data_root/$dataset"
+    GROUPS_DIR="$DATA_DIR/students/groups"
 }
 
-read_data_lines() {
+# Проверяем ссылки внутри выбранного дерева данных.
+check_data_path() {
+    local path=$1
+    while [[ $path == "${DATA_DIR%/}/"* ]]; do
+        if [[ -L $path ]]; then
+            error "Символическая ссылка в пути к данным: «$path»."
+            return 1
+        fi
+        path=${path%/*}
+    done
+}
+
+discover_data() {
+    local path name candidate attendance_file
+    check_data_path "$GROUPS_DIR" || return 1
+    if [[ ! -d $GROUPS_DIR || ! -r $GROUPS_DIR || ! -x $GROUPS_DIR ]]; then
+        error "Не удалось открыть списки групп в «$GROUPS_DIR»."
+        return 1
+    fi
+    for path in "$GROUPS_DIR"/*; do
+        [[ -L $path || -f $path ]] || continue
+        check_data_path "$path" || return 1
+        name=${path##*/}
+        if [[ ! $name =~ ^$GROUP_PATTERN$ ]]; then
+            error "Недопустимое имя группы «$name»."
+            return 1
+        fi
+        GROUPS_FOUND+=("$name")
+    done
+    if ((${#GROUPS_FOUND[@]} == 0)); then
+        error "В «$GROUPS_DIR» не найдены списки групп."
+        return 1
+    fi
+
+    # У предмета есть папка тестов или файлы посещаемости.
+    for path in "${DATA_DIR%/}"/*; do
+        [[ -d $path && ${path##*/} != students ]] || continue
+        if [[ ! -d $path/tests && ! -L $path/tests ]]; then
+            attendance_file=''
+            for candidate in "$path"/*-attendance; do
+                [[ -f $candidate && ! -L $candidate ]] || continue
+                attendance_file=$candidate
+                break
+            done
+            [[ -n $attendance_file ]] || continue
+        fi
+        check_data_path "$path/tests" || return 1
+        name=${path##*/}
+        if [[ $name =~ $CONTROL_PATTERN ]]; then
+            error "Недопустимый символ в имени папки предмета «$name»."
+            return 1
+        fi
+        SUBJECTS+=("$name")
+    done
+    if ((${#SUBJECTS[@]} == 0)); then
+        error "В «$DATA_DIR» не найдено ни одного предмета."
+        return 1
+    fi
+}
+
+# В папке tests каждый обычный файл считается отдельным тестом.
+list_tests() {
+    local tests_dir="$1/tests" allow_empty=${3-} path name
+    local -n test_names=$2
+    test_names=()
+    check_data_path "$tests_dir" || return 1
+    if [[ ! -d $tests_dir || ! -r $tests_dir || ! -x $tests_dir ]]; then
+        error "Не удалось открыть папку тестов «$tests_dir»."
+        return 1
+    fi
+    for path in "$tests_dir"/*; do
+        [[ -L $path || -f $path ]] || continue
+        check_data_path "$path" || return 1
+        name=${path##*/}
+        if [[ $name =~ $CONTROL_PATTERN ]]; then
+            error "Недопустимый символ в имени теста «$name»."
+            return 1
+        fi
+        test_names+=("$name")
+    done
+    if ((${#test_names[@]} == 0)) && [[ $allow_empty != allow-empty ]]; then
+        error "В папке «$tests_dir» нет файлов тестов."
+        return 1
+    fi
+}
+
+check_data_file() {
     local file=$1
-    local -n output_lines=$2
+    check_data_path "$file" || return 1
     if [[ ! -f $file || ! -r $file ]]; then
         error "Файл «$file» отсутствует или недоступен для чтения."
         return 1
     fi
-    mapfile -t output_lines < "$file" || { error "Не удалось прочитать «$file»."; return 1; }
-    if ((${#output_lines[@]})); then
-        output_lines[0]=${output_lines[0]#$'\xEF\xBB\xBF'}
+}
+
+# Читаем и последнюю строку без LF. BOM удаляем только в начале файла.
+read_data_line() {
+    local -n text=$1 number=$2
+    if ! IFS= read -r text && [[ -z $text ]]; then
+        return 1
     fi
+    ((++number))
+    if ((number == 1)); then
+        text=${text#$'\xEF\xBB\xBF'}
+    fi
+    text=${text%$'\r'}
 }
 
-load_roster() {
-    local group=$1 file
-    # Windows открывает файл даже при неверном регистре. Для поиска
-    # попыток нужно точное имя группы, поэтому сверяем его со списком файлов.
-    for file in "$DATA_DIR/students/groups/"*; do
-        if [[ ${file##*/} == "$group" ]]; then
-            read_roster "$file" "$2"
-            return $?
-        fi
-    done
-    error "Группа «$group» не найдена. Используйте латинские A и e и проверьте регистр."
-}
-
+# Для общего индекса передаём префикс «группа;».
 read_roster() {
-    local file=$1 line index
+    local file=$1 prefix=${3-} login line_number=0
     local -n output_roster=$2
-    local -a lines=()
-    read_data_lines "$file" lines || return 1
-    output_roster=()
+    check_data_file "$file" || return 1
 
-    for index in "${!lines[@]}"; do
-        line=${lines[$index]%$'\r'}
-        [[ $line =~ ^[[:blank:]]*$ ]] && continue
-        if [[ ! $line =~ ^$LOGIN_PATTERN$ ]]; then
-            error "«$file», строка $((index + 1)): ожидался один логин."
+    while read_data_line login line_number; do
+        [[ $login =~ ^[[:blank:]]*$ ]] && continue
+        if [[ ! $login =~ ^$LOGIN_PATTERN$ ]]; then
+            error "«$file», строка $line_number: ожидался один логин."
             return 1
         fi
-        output_roster[$line]=1
-    done
+        output_roster["$prefix$login"]=1
+    done < "$file"
 }
 
+# Собирает пары «группа и логин» для отчётов по всем группам.
 load_student_index() {
-    local -n student_index=$1
-    local -A roster=()
-    local file group login found=0
-    for file in "$DATA_DIR/students/groups/"*; do
-        [[ -f $file ]] || continue
-        found=1
-        group=${file##*/}
-        read_roster "$file" roster || return 1
-        for login in "${!roster[@]}"; do
-            student_index["$group;$login"]=1
-        done
+    local group
+    for group in "${GROUPS_FOUND[@]}"; do
+        read_roster "$GROUPS_DIR/$group" "$1" "$group;" || return 1
     done
-    ((found)) || error "В «$DATA_DIR/students/groups» не найдены списки групп."
-}
-
-warn_unknown_students() {
-    if (($1 > 0)); then
-        printf 'Предупреждение. Пропущено попыток студентов вне списков групп: %d.\n' "$1" >&2
-    fi
 }
 
 valid_date() {
     local date=$1
-    local year=$((10#${date:0:4})) month=$((10#${date:5:2})) day=$((10#${date:8:2}))
     local -a days_in_month=(0 31 28 31 30 31 30 31 31 30 31 30 31)
+    local year=$((10#${date:0:4}))
+    local month=$((10#${date:5:2}))
+    local day=$((10#${date:8:2}))
     ((year > 0 && month >= 1 && month <= 12 && day >= 1)) || return 1
+    local last_day=${days_in_month[month]}
     if ((month == 2 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0))); then
-        days_in_month[2]=29
+        last_day=29
     fi
-    ((day <= days_in_month[month]))
+    ((day <= last_day))
 }
 
-parse_attempt() {
+# Проверяем всю строку, чтобы read не пропустил лишний разделитель.
+validate_attempt() {
     local line=$1 file=$2 line_number=$3
-    local -n fields=$4
     if [[ ! $line =~ $ATTEMPT_PATTERN ]]; then
         error "«$file», строка $line_number: неверный формат попытки тестирования."
         return 1
     fi
-    # Сохраняем группу, логин, дату и цифру оценки без суффикса.
-    fields=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}")
-    local group=${fields[0]}
-    if ! valid_group_name "$group" || ! valid_date "${fields[2]}"; then
-        error "«$file», строка $line_number: неверная группа или календарная дата."
+    local date=${BASH_REMATCH[2]}
+    if ! valid_date "$date"; then
+        error "«$file», строка $line_number: неверная календарная дата."
         return 1
     fi
 }
@@ -187,7 +206,7 @@ parse_attempt() {
 print_cell() {
     local LC_ALL=C
     local width=$1 value=$2
-    # В UTF-8 байты продолжения не занимают отдельную позицию в колонке.
+    # Считаем символы UTF-8, пропуская байты продолжения.
     local continuation=$'[\x80-\xbf]'
     local characters=${value//$continuation/}
     local spaces=$((width - ${#characters}))
@@ -195,142 +214,167 @@ print_cell() {
     printf '%s%*s' "$value" "$spaces" ''
 }
 
+# Перед последней колонкой идут пары «ширина, значение».
+print_row() {
+    while (($# > 1)); do
+        print_cell "$1" "$2"
+        shift 2
+    done
+    printf '%s\n' "$1"
+}
+
+# Считает посещения для студентов выбранной группы.
 attendance() {
-    local group=$1 subject subject_dir
-    validate_group_subject "$group" "$2" subject || return 2
-    resolve_subject_dir "$subject" subject_dir || return 1
+    local group=$1 subject_dir="${DATA_DIR%/}/$2"
 
     local -A roster=() visits=()
-    local -a lines=()
     local file="$subject_dir/$group-attendance"
-    local index line login ones visits_count login_width=18
+    local line line_number=0 login ones visits_count
     local pattern="^($LOGIN_PATTERN)[[:blank:]]+([01]+)$"
-    load_roster "$group" roster || return 1
-    read_data_lines "$file" lines || return 1
+    read_roster "$GROUPS_DIR/$group" roster || return 1
+    check_data_file "$file" || return 1
 
-    for index in "${!lines[@]}"; do
-        line=${lines[$index]%$'\r'}
+    while read_data_line line line_number; do
         [[ $line =~ ^[[:blank:]]*$ ]] && continue
         if [[ ! $line =~ $pattern ]]; then
-            error "«$file», строка $((index + 1)): ожидались логин и строка из 0 и 1."
+            error "«$file», строка $line_number: ожидались логин и строка из 0 и 1."
             return 1
         fi
         login=${BASH_REMATCH[1]}
         [[ ${roster[$login]+found} ]] || continue
         if [[ ${visits[$login]+found} ]]; then
-            error "«$file», строка $((index + 1)): повторная запись посещаемости для «$login»."
+            error "«$file», строка $line_number: повторная запись посещаемости для «$login»."
             return 1
         fi
 
         # Каждая единица обозначает одно посещённое занятие.
         ones=${BASH_REMATCH[2]//0/}
         visits[$login]=${#ones}
-    done
+    done < "$file" || return 1
 
     if ((${#roster[@]} == 0)); then
         printf 'Список группы «%s» пуст.\n' "$group"
         return 0
     fi
 
+    local login_width=8
     for login in "${!roster[@]}"; do
-        (( ${#login} + 2 > login_width )) && login_width=$((${#login} + 2))
+        ((${#login} + 2 > login_width)) && login_width=$((${#login} + 2))
     done
-    print_cell "$login_width" 'Логин'
-    printf 'Посещено\n'
+    print_row "$login_width" 'Логин' 'Посещено'
+    # Значение -1 ставит пропущенные записи после нулей.
     for login in "${!roster[@]}"; do
         printf '%s\t%s\n' "$login" "${visits[$login]:--1}"
     done | LC_ALL=C sort -t $'\t' -k2,2nr -k1,1 |
         while IFS=$'\t' read -r login visits_count; do
-            print_cell "$login_width" "$login"
             [[ $visits_count == -1 ]] && visits_count='Нет записи'
-            printf '%s\n' "$visits_count"
+            print_row "$login_width" "$login" "$visits_count"
         done
 }
 
+# Выводит студентов, у которых ещё нет успешной попытки.
 failed_tests() {
-    local group=$1 test=$3 subject subject_dir
-    validate_group_subject "$group" "$2" subject || return 2
-    if [[ ! $test =~ ^[1-4]$ ]]; then
-        usage_error 'Номер теста должен быть от 1 до 4.'
-        return 2
-    fi
-    resolve_subject_dir "$subject" subject_dir || return 1
+    local group=$1 test=$3 subject_dir="${DATA_DIR%/}/$2"
+    local -A roster=() statuses=()
+    local -a rows=()
+    local file="$subject_dir/tests/$test"
+    local line line_number=0 attempt_group login mark status
+    read_roster "$GROUPS_DIR/$group" roster || return 1
+    check_data_file "$file" || return 1
 
-    local -A roster=() status=()
-    local -a lines=() attempt=() rows=()
-    local file="$subject_dir/tests/TEST-$test"
-    local index line attempt_group login grade unknown_count=0
-    load_roster "$group" roster || return 1
-    read_data_lines "$file" lines || return 1
-
-    for index in "${!lines[@]}"; do
-        line=${lines[$index]%$'\r'}
+    while read_data_line line line_number; do
         [[ $line =~ ^[[:blank:]]*$ ]] && continue
-        # Ошибка в строке другой группы не влияет на этот отчёт.
+        # Записи с корректным именем другой группы не относятся к отчёту.
         attempt_group=${line%%;*}
-        if [[ $line == *';'* && $attempt_group != "$group" ]] && valid_group_name "$attempt_group"; then
+        if [[ $line == *';'* && $attempt_group != "$group" ]] &&
+            [[ $attempt_group =~ ^$GROUP_PATTERN$ ]]; then
             continue
         fi
-        parse_attempt "$line" "$file" "$((index + 1))" attempt || return 1
-        login=${attempt[1]}
-        grade=${attempt[3]}
-        if [[ ! ${roster[$login]+found} ]]; then
-            ((++unknown_count))
-            continue
-        fi
-        # После успешной попытки следующие оценки статус не меняют.
-        [[ ${status[$login]} == 'Сдал' ]] && continue
-        if ((grade >= 3)); then
-            status[$login]='Сдал'
+        validate_attempt "$line" "$file" "$line_number" || return 1
+        IFS=';' read -r attempt_group login _ _ mark <<< "$line"
+        [[ ${roster[$login]+found} ]] || continue
+        # Поздняя двойка не отменяет уже сданный тест.
+        [[ ${statuses[$login]} == 'Сдал' ]] && continue
+        if [[ $mark == 2* ]]; then
+            statuses[$login]='Не сдал'
         else
-            status[$login]='Не сдал'
+            statuses[$login]='Сдал'
         fi
-    done
+    done < "$file" || return 1
 
+    local login_width=8
     for login in "${!roster[@]}"; do
-        [[ ${status[$login]} == 'Сдал' ]] && continue
-        rows+=("$login"$'\t'"${status[$login]:-Не проходил}")
+        status=${statuses[$login]:-Не проходил}
+        [[ $status == 'Сдал' ]] && continue
+        ((${#login} + 2 > login_width)) && login_width=$((${#login} + 2))
+        rows+=("$login"$'\t'"$status")
     done
-    warn_unknown_students "$unknown_count"
 
     if ((${#rows[@]} == 0)); then
         printf 'Студентов без успешной попытки не найдено.\n'
         return 0
     fi
-    printf 'Логин\tСтатус\n'
-    printf '%s\n' "${rows[@]}" | LC_ALL=C sort -t $'\t' -k1,1
+    print_row "$login_width" 'Логин' 'Статус'
+    printf '%s\n' "${rows[@]}" | LC_ALL=C sort -t $'\t' -k1,1 |
+        while IFS=$'\t' read -r login status; do
+            print_row "$login_width" "$login" "$status"
+        done
 }
 
+find_circus_subject() {
+    local -n result=$1
+    local subject_name name index
+    # Для букв названия задаём регистр явно, чтобы поиск работал и в локали C.
+    local -a upper=(В Д Е И К Л О Р Ц)
+    local -a lower=(в д е и к л о р ц)
+    result=''
+
+    for subject_name in "${SUBJECTS[@]}"; do
+        name=${subject_name//[[:blank:]_-]/}
+        # Отбрасываем числовой суффикс в имени папки.
+        name=${name%"${name##*[!0-9]}"}
+        for index in "${!upper[@]}"; do
+            name=${name//"${upper[index]}"/"${lower[index]}"}
+        done
+        [[ $name == цирковоедело ]] || continue
+        if [[ -n $result ]]; then
+            error "Найдено несколько папок предмета «Цирковое дело»: «$result» и «$subject_name»."
+            return 1
+        fi
+        result=$subject_name
+    done
+    [[ -n $result ]] || error 'В выбранном наборе не найден предмет «Цирковое дело».'
+}
+
+# Считает средний балл по успешным попыткам и выводит рейтинг.
 top_students() {
-    local limit=$1 subject_dir
-    if [[ ! $limit =~ ^[0-9]+$ || ! $limit =~ [1-9] ]]; then
-        usage_error 'Количество студентов должно быть положительным целым числом.'
-        return 2
+    local subject=$1 limit
+    local subject_dir="${DATA_DIR%/}/$subject"
+    if [[ $2 =~ ^0*([1-9][0-9]*)$ ]]; then
+        # Храним число без ведущих нулей и сравниваем со счётчиком как строку.
+        limit=${BASH_REMATCH[1]}
+    else
+        error 'Количество студентов должно быть положительным целым числом.'
+        return 1
     fi
-    # N нужен только для сравнения со счётчиком строк. Убираем начальные нули
-    # и оставляем его строкой, чтобы большие значения не переполняли арифметику.
-    limit=${limit#"${limit%%[!0]*}"}
-    resolve_subject_dir "$CIRCUS_SUBJECT" subject_dir || return 1
 
     local -A students=() sums=() counts=() details=()
-    local -a lines=() attempt=()
-    local test file index line group login date grade key count max_count=0
-    local login_width=18 group_width=11 unknown_count=0
+    local -a tests=()
+    local test file line line_number group login date mark grade key count detail max_count=0
+    list_tests "$subject_dir" tests || return 1
     load_student_index students || return 1
 
-    for test in "${TEST_NUMBERS[@]}"; do
-        file="$subject_dir/tests/TEST-$test"
-        read_data_lines "$file" lines || return 1
-        for index in "${!lines[@]}"; do
-            line=${lines[$index]%$'\r'}
+    for test in "${tests[@]}"; do
+        file="$subject_dir/tests/$test"
+        check_data_file "$file" || return 1
+        line_number=0
+        while read_data_line line line_number; do
             [[ $line =~ ^[[:blank:]]*$ ]] && continue
-            parse_attempt "$line" "$file" "$((index + 1))" attempt || return 1
-            group=${attempt[0]} login=${attempt[1]} date=${attempt[2]} grade=${attempt[3]}
+            validate_attempt "$line" "$file" "$line_number" || return 1
+            IFS=';' read -r group login date _ mark <<< "$line"
             key="$group;$login"
-            if [[ ! ${students[$key]+found} ]]; then
-                ((++unknown_count))
-                continue
-            fi
+            [[ ${students[$key]+found} ]] || continue
+            grade=${mark:0:1}
             ((grade >= 3)) || continue
             # Каждая успешная попытка участвует в среднем отдельно.
             sums[$key]=$(( ${sums[$key]:-0} + grade ))
@@ -339,182 +383,164 @@ top_students() {
             if ((count > max_count)); then
                 max_count=$count
             fi
-            details[$key]+="       TEST-$test  $date  $grade"$'\n'
-            (( ${#login} + 2 > login_width )) && login_width=$((${#login} + 2))
-            (( ${#group} + 2 > group_width )) && group_width=$((${#group} + 2))
-        done
+            printf -v detail '  %s  %s  %s\n' "$test" "$date" "$grade"
+            details[$key]+=$detail
+        done < "$file" || return 1
     done
-    warn_unknown_students "$unknown_count"
 
     if ((${#sums[@]} == 0)); then
-        printf 'Успешных попыток по Цирковому делу не найдено.\n'
+        printf 'Успешных попыток по предмету «%s» не найдено.\n' "$subject"
         return 0
     fi
 
-    local mean mean_text rank=0
-    # Разность двух разных средних не меньше 1 / max_count².
-    # После умножения на max_count² целочисленное деление сохраняет порядок.
+    # Разные средние отличаются хотя бы на 1 / max_count².
+    # Умножаем на max_count², чтобы целочисленное деление сохранило порядок.
     local scale=$((max_count * max_count))
-    print_cell 7 'Место'
-    print_cell "$login_width" 'Логин'
-    print_cell "$group_width" 'Группа'
-    print_cell 15 'Средний балл'
-    printf 'Успешных попыток\n'
-    {
-        for key in "${!sums[@]}"; do
-            printf '%d\t%s\n' "$(( ${sums[$key]} * scale / ${counts[$key]} ))" "$key"
-        done
-    } | LC_ALL=C sort -t $'\t' -k1,1nr -k2,2 |
+    local sum sort_key rank=0 mean mean_text
+    local rank_width=7 login_width=8 group_width=8 student_count=${#sums[@]}
+    ((${#student_count} + 2 > rank_width)) && rank_width=$((${#student_count} + 2))
+    for key in "${!sums[@]}"; do
+        group=${key%%;*}
+        login=${key#*;}
+        ((${#login} + 2 > login_width)) && login_width=$((${#login} + 2))
+        ((${#group} + 2 > group_width)) && group_width=$((${#group} + 2))
+    done
+    print_row "$rank_width" 'Место' "$login_width" 'Логин' "$group_width" 'Группа' \
+        15 'Средний балл' 'Успешных попыток'
+    for key in "${!sums[@]}"; do
+        sum=${sums[$key]}
+        count=${counts[$key]}
+        sort_key=$((sum * scale / count))
+        printf '%d\t%s\n' "$sort_key" "$key"
+    done | LC_ALL=C sort -t $'\t' -k1,1nr -k2,2 |
         while IFS=$'\t' read -r _ key; do
             [[ $rank == "$limit" ]] && continue
             ((++rank))
+            sum=${sums[$key]}
             count=${counts[$key]}
-            mean=$(( (100 * ${sums[$key]} + count / 2) / count ))
+            # До сотых округляем только при выводе.
+            mean=$(( (100 * sum + count / 2) / count ))
             printf -v mean_text '%d.%02d' "$((mean / 100))" "$((mean % 100))"
-            print_cell 7 "$rank"
-            print_cell "$login_width" "${key#*;}"
-            print_cell "$group_width" "${key%%;*}"
-            print_cell 15 "$mean_text"
-            printf '%d\n' "$count"
+            print_row "$rank_width" "$rank" "$login_width" "${key#*;}" "$group_width" "${key%%;*}" \
+                15 "$mean_text" "$count"
             printf '%s' "${details[$key]}"
         done
 }
 
-collect_first_attempts() {
-    local subject=$1 subject_dir=$2 test=$3 year=$4
-    local -n output_rows=$5
-    local -n known_students=$6 skipped=$7
-    local -a lines=() attempt=()
-    local -A earliest=()
-    local file="$subject_dir/tests/TEST-$test"
-    local index line date grade key
-    read_data_lines "$file" lines || return 1
-
-    for index in "${!lines[@]}"; do
-        line=${lines[$index]%$'\r'}
-        [[ $line =~ ^[[:blank:]]*$ ]] && continue
-        parse_attempt "$line" "$file" "$((index + 1))" attempt || return 1
-        key="${attempt[0]};${attempt[1]}"
-        if [[ ! ${known_students[$key]+found} ]]; then
-            ((++skipped))
-            continue
-        fi
-        date=${attempt[2]}
-        grade=${attempt[3]}
-        # Даты ГГГГ-ММ-ДД сравниваются как строки. Строгое сравнение
-        # сохраняет первую строку файла, если даты совпали.
-        if [[ ! ${earliest[$key]+found} || $date < ${earliest[$key]%%;*} ]]; then
-            earliest[$key]="$date;$grade"
-        fi
-    done
-
-    # Фильтруем по году и оценке только после выбора первой попытки.
-    for key in "${!earliest[@]}"; do
-        date=${earliest[$key]%%;*}
-        grade=${earliest[$key]#*;}
-        if [[ ${date:0:4} == "$year" ]] && ((grade >= 3)); then
-            output_rows+=("${key%%;*}"$'\t'"${key#*;}"$'\t'"$subject"$'\t'"TEST-$test"$'\t'"$grade")
-        fi
-    done
-}
-
+# Собирает отчёт о первых попытках по всем найденным предметам.
 first_attempt() {
     local year=$1
     if [[ ! $year =~ ^[0-9]{4}$ || $year == 0000 ]]; then
-        usage_error 'Укажите календарный год четырьмя цифрами, например 2026.'
-        return 2
+        error 'Укажите календарный год четырьмя цифрами, например 2026.'
+        return 1
     fi
 
-    local retakes_dir circus_dir test grade row login subject login_width=18 unknown_count=0
-    local -A students=()
-    local -a rows=()
-    resolve_subject_dir "$RETAKES_SUBJECT" retakes_dir || return 1
-    resolve_subject_dir "$CIRCUS_SUBJECT" circus_dir || return 1
+    local subject subject_dir test file line line_number group login date mark grade key row
+    local -A students=() earliest=()
+    local -a rows=() tests=()
+    local login_width=8 subject_width=9 test_width=8 found_tests=0
     load_student_index students || return 1
-    for test in "${TEST_NUMBERS[@]}"; do
-        collect_first_attempts "$RETAKES_SUBJECT" "$retakes_dir" "$test" "$year" rows students unknown_count || return 1
-        collect_first_attempts "$CIRCUS_SUBJECT" "$circus_dir" "$test" "$year" rows students unknown_count || return 1
-    done
-    warn_unknown_students "$unknown_count"
+    for subject in "${SUBJECTS[@]}"; do
+        subject_dir="${DATA_DIR%/}/$subject"
+        # Общий отчёт включает только предметы с файлами тестов.
+        [[ -e $subject_dir/tests || -L $subject_dir/tests ]] || continue
+        list_tests "$subject_dir" tests allow-empty || return 1
+        ((${#tests[@]} > 0)) || continue
+        found_tests=1
+        ((${#subject} + 2 > subject_width)) && subject_width=$((${#subject} + 2))
+        for test in "${tests[@]}"; do
+            ((${#test} + 2 > test_width)) && test_width=$((${#test} + 2))
+            file="$subject_dir/tests/$test"
+            check_data_file "$file" || return 1
+            earliest=()
+            line_number=0
+            while read_data_line line line_number; do
+                [[ $line =~ ^[[:blank:]]*$ ]] && continue
+                validate_attempt "$line" "$file" "$line_number" || return 1
+                IFS=';' read -r group login date _ mark <<< "$line"
+                key="$group;$login"
+                [[ ${students[$key]+found} ]] || continue
+                # При равных датах оставляем первую запись файла.
+                if [[ ! ${earliest[$key]+found} || $date < ${earliest[$key]%%;*} ]]; then
+                    earliest[$key]="$date;${mark:0:1}"
+                fi
+            done < "$file" || return 1
 
+            # Год и оценку проверяем после выбора первой попытки.
+            for key in "${!earliest[@]}"; do
+                IFS=';' read -r date grade <<< "${earliest[$key]}"
+                if [[ ${date:0:4} == "$year" ]] && ((grade >= 3)); then
+                    group=${key%%;*}
+                    login=${key#*;}
+                    ((${#login} + 2 > login_width)) && login_width=$((${#login} + 2))
+                    printf -v row '%s\t%s\t%s\t%s\t%s' "$group" "$login" "$subject" "$test" "$grade"
+                    rows+=("$row")
+                fi
+            done
+        done
+    done
+    if ((!found_tests)); then
+        error 'В найденных предметах нет файлов тестов.'
+        return 1
+    fi
     if ((${#rows[@]} == 0)); then
         printf 'Успешных первых попыток за %s год не найдено.\n' "$year"
         return 0
     fi
-    for row in "${rows[@]}"; do
-        row=${row#*$'\t'}
-        login=${row%%$'\t'*}
-        (( ${#login} + 2 > login_width )) && login_width=$((${#login} + 2))
-    done
-    print_cell "$login_width" 'Логин'
-    print_cell 20 'Предмет'
-    print_cell 9 'Тест'
-    printf 'Оценка\n'
+    print_row "$login_width" 'Логин' "$subject_width" 'Предмет' "$test_width" 'Тест' 'Оценка'
     # Группа нужна для сортировки и разделения студентов с одинаковым логином.
     printf '%s\n' "${rows[@]}" | LC_ALL=C sort -t $'\t' -k1,1 -k2,2 -k3,3 -k4,4 |
         while IFS=$'\t' read -r _ login subject test grade; do
-            print_cell "$login_width" "$login"
-            print_cell 20 "$subject"
-            print_cell 9 "$test"
-            printf '%s\n' "$grade"
+            print_row "$login_width" "$login" "$subject_width" "$subject" "$test_width" "$test" "$grade"
         done
 }
 
-show_help() {
-    cat <<'HELP'
-Анализ посещаемости и результатов тестирования студентов
-
-  bash lab4.sh                              Интерактивное меню
-  bash lab4.sh attendance ГРУППА ПРЕДМЕТ     Рейтинг посещаемости
-  bash lab4.sh failed ГРУППА ПРЕДМЕТ НОМЕР   Студенты, не сдавшие тест
-  bash lab4.sh top [N]                      Лучшие по Цирковому делу (по умолчанию 10)
-  bash lab4.sh first-attempt ГОД             Успешные первые попытки за календарный год
-  bash lab4.sh --help                       Эта справка
-
-Предметы: 1 — Цирковое_Дело, 2 — Пересдачеведение. Можно ввести название.
-Группа: A-06-23 или Ae-21-23 (буквы A и e латинские). Номера тестов: 1–4.
-Данные: data/labfiles-3-26 рядом с lab4.sh.
-Папки предметов находятся автоматически, в том числе с номером в конце имени.
-HELP
-}
-
-run_command() {
-    local command=$1
-    shift
-    case $command in
-        attendance)
-            if (($# != 2)); then usage_error 'Нужны группа и предмет.'; return 2; fi
-            attendance "$1" "$2"
-            ;;
-        failed)
-            if (($# != 3)); then usage_error 'Нужны группа, предмет и номер теста.'; return 2; fi
-            failed_tests "$1" "$2" "$3"
-            ;;
-        top)
-            if (($# > 1)); then usage_error 'Команда top принимает только количество студентов.'; return 2; fi
-            top_students "${1-10}"
-            ;;
-        first-attempt)
-            if (($# != 1)); then usage_error 'Укажите один календарный год.'; return 2; fi
-            first_attempt "$1"
-            ;;
-        --help)
-            if (($# != 0)); then usage_error 'У справки нет дополнительных параметров.'; return 2; fi
-            show_help
-            ;;
-        *) usage_error "Неизвестная команда «$command»." ;;
-    esac
+print_input_gap() {
+    # При вводе из файла терминал не переносит строку после ответа.
+    [[ -t 0 ]] || printf '\n'
+    printf '\n'
 }
 
 read_menu_input() {
     local -n input=$1
-    read -r input || return 1
+    # У последней строки в файле может не быть перевода строки.
+    if ! read -r input && [[ -z $input ]]; then
+        return 1
+    fi
     # При чтении из файла Windows после перевода строки остаётся символ CR.
     input=${input%$'\r'}
+    print_input_gap
+}
+
+choose_item() {
+    local -n selected=$1
+    local prompt=$2 cancel_label=$3 choice index number
+    shift 3
+    local -a items=("$@")
+
+    printf '%s\n' "$prompt"
+    for index in "${!items[@]}"; do
+        printf '%d. %s\n' "$((index + 1))" "${items[$index]}"
+    done
+    printf '0. %s\n' "$cancel_label"
+    while true; do
+        printf 'Номер: '
+        read_menu_input choice || return 1
+        [[ $choice == 0 ]] && return 1
+        for index in "${!items[@]}"; do
+            number=$((index + 1))
+            if [[ $choice == "$number" ]]; then
+                selected=${items[$index]}
+                return 0
+            fi
+        done
+        error 'Выберите номер из списка.'
+    done
 }
 
 interactive_menu() {
     local choice group subject test limit year answer
+    local -a tests=()
     while true; do
         cat <<'MENU'
 ========================================
@@ -534,27 +560,25 @@ MENU
         case $choice in
             0) return 0 ;;
             1|2)
-                printf 'Группа (например, A-06-23 или Ae-21-23, A и e латинские): '
-                read_menu_input group || return 0
-                printf 'Предмет (1 — Цирковое дело, 2 — Пересдачеведение): '
-                read_menu_input subject || return 0
+                choose_item group 'Выберите группу' 'Назад' "${GROUPS_FOUND[@]}" || continue
+                choose_item subject 'Выберите предмет' 'Назад' "${SUBJECTS[@]}" || continue
                 if [[ $choice == 1 ]]; then
-                    run_command attendance "$group" "$subject"
-                else
-                    printf 'Номер теста (1–4): '
-                    read_menu_input test || return 0
-                    run_command failed "$group" "$subject" "$test"
+                    attendance "$group" "$subject"
+                elif list_tests "${DATA_DIR%/}/$subject" tests; then
+                    choose_item test 'Выберите тест' 'Назад' "${tests[@]}" || continue
+                    failed_tests "$group" "$subject" "$test"
                 fi
                 ;;
             3)
+                find_circus_subject subject || continue
                 printf 'Количество студентов [10]: '
                 read_menu_input limit || return 0
-                run_command top "${limit:-10}"
+                top_students "$subject" "${limit:-10}"
                 ;;
             4)
                 printf 'Календарный год: '
                 read_menu_input year || return 0
-                run_command first-attempt "$year"
+                first_attempt "$year"
                 ;;
             *) error 'Выберите пункт от 0 до 4.' ;;
         esac
@@ -562,12 +586,13 @@ MENU
         printf '\nEnter — вернуться в меню, 0 — выйти: '
         read_menu_input answer || return 0
         [[ $answer == 0 ]] && return 0
-        printf '\n'
     done
 }
 
-if (($# == 0)); then
-    interactive_menu
-else
-    run_command "$@"
+if (($# > 0)); then
+    error 'Запустите скрипт без аргументов: bash lab4.sh.'
+    exit 2
 fi
+choose_data_dir || exit 1
+discover_data || exit 1
+interactive_menu
